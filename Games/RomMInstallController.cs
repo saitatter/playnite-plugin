@@ -6,7 +6,6 @@ using System.Collections.Generic;
 using System.IO;
 using System.Net.Http;
 using System.Threading;
-using System.Threading.Tasks;
 using SharpCompress.Archives;
 using SharpCompress.Common;
 using System.Linq;
@@ -27,7 +26,7 @@ namespace RomM.Games
 
         public override void Dispose()
         {
-            _watcherToken?.Cancel();
+            try { _watcherToken?.Cancel(); } catch { }
             base.Dispose();
         }
 
@@ -35,99 +34,99 @@ namespace RomM.Games
         {
             var info = Game.GetRomMGameInfo();
 
-            var dstPath = info.Mapping?.DestinationPathResolved ??
-                throw new Exception("Mapped emulator data cannot be found, try removing and re-adding.");
+            var dstPath = info.Mapping?.DestinationPathResolved
+                ?? throw new Exception("Mapped emulator data cannot be found, try removing and re-adding.");
 
             _watcherToken = new CancellationTokenSource();
 
-            Task.Run(async () =>
-            {
-                try
+            _romM.Playnite.Dialogs.ActivateGlobalProgress(
+                async progress =>
                 {
-                    // Fetch file from content endpoint
-                    HttpResponseMessage response = await RomM.GetAsync(info.DownloadUrl, HttpCompletionOption.ResponseHeadersRead);
-                    response.EnsureSuccessStatusCode();
-
-                    List<GameRom> roms = new List<GameRom>();
-                    string installDir = Path.Combine(dstPath, Path.GetFileNameWithoutExtension(info.FileName));
-                    string gamePath = Path.Combine(installDir, info.FileName);
-                    if (info.HasMultipleFiles)
+                    try
                     {
-                        // File name for multi-file archives is the folder name, so we append .zip
-                        gamePath = Path.Combine(installDir, info.FileName + ".zip");
-                    }
+                        progress.ProgressMaxValue = 100;
+                        progress.IsIndeterminate = true;
+                        progress.Text = $"Starting download: {Game.Name}";
 
-                    if (_romM.Playnite.ApplicationInfo.IsPortable)
-                    {
-                        installDir = installDir.Replace(_romM.Playnite.Paths.ApplicationPath, ExpandableVariables.PlayniteDirectory);
-                        gamePath = gamePath.Replace(_romM.Playnite.Paths.ApplicationPath, ExpandableVariables.PlayniteDirectory);
-                    }
+                        HttpResponseMessage response =
+                            await RomM.GetAsync(info.DownloadUrl, HttpCompletionOption.ResponseHeadersRead);
 
-                    Logger.Debug($"Downloading {Game.Name} to {gamePath}...");
-                    Directory.CreateDirectory(installDir);
+                        response.EnsureSuccessStatusCode();
+                        var totalBytes = response.Content.Headers.ContentLength;
 
-                    // Stream the file directly to disk
-                    using (var fileStream = new FileStream(gamePath, FileMode.Create, FileAccess.Write, FileShare.None, 8192, true))
-                    using (var httpStream = await response.Content.ReadAsStreamAsync())
-                    {
-                        byte[] buffer = new byte[65536];
-                        int bytesRead;
+                        // paths
+                        string installDir = Path.Combine(dstPath, Path.GetFileNameWithoutExtension(info.FileName));
+                        string gamePath = info.HasMultipleFiles
+                            ? Path.Combine(installDir, info.FileName + ".zip")
+                            : Path.Combine(installDir, info.FileName);
 
-                        while ((bytesRead = await httpStream.ReadAsync(buffer, 0, buffer.Length, _watcherToken.Token)) > 0)
+                        Directory.CreateDirectory(installDir);
+
+                        progress.IsIndeterminate = !totalBytes.HasValue;
+                        progress.Text = "Downloading...";
+
+                        long downloaded = 0;
+                        byte[] buffer = new byte[1024 * 256];
+
+                        using (var httpStream = await response.Content.ReadAsStreamAsync())
+                        using (var fileStream = new FileStream(
+                            gamePath,
+                            FileMode.Create,
+                            FileAccess.Write,
+                            FileShare.None,
+                            buffer.Length,
+                            true))
                         {
-                            await fileStream.WriteAsync(buffer, 0, bytesRead, _watcherToken.Token);
+                            while (true)
+                            {
+                                progress.CancelToken.ThrowIfCancellationRequested();
+
+                                int read = await httpStream.ReadAsync(buffer, 0, buffer.Length);
+                                if (read <= 0)
+                                    break;
+
+                                await fileStream.WriteAsync(buffer, 0, read);
+                                downloaded += read;
+
+                                if (totalBytes.HasValue && totalBytes.Value > 0)
+                                {
+                                    double pct = (double)downloaded / totalBytes.Value;
+                                    progress.CurrentProgressValue = Math.Min(85, pct * 85);
+                                    progress.Text = $"Downloading {Game.Name}... {pct * 100:0}%";
+                                }
+                            }
                         }
-                    }
 
-                    Logger.Debug($"Download of {Game.Name} complete.");
+                        progress.IsIndeterminate = false;
+                        progress.CurrentProgressValue = 85;
+                        progress.Text = "Extracting...";
 
-                    // Always extract top-level file of multi-file archives
-                    if (info.HasMultipleFiles || (info.Mapping.AutoExtract && IsFileCompressed(gamePath)))
-                    {
-                        Logger.Debug($"Extracting {Game.Name} to {installDir}...");
-                        // Extract the archive to the install directory
-                        ExtractArchive(gamePath, installDir);
-
-                        // Delete the compressed file
-                        File.Delete(gamePath);
-
-                        // Extract nested archives if auto-extract is enabled
-                        if (info.HasMultipleFiles && info.Mapping.AutoExtract)
+                        if (info.HasMultipleFiles || (info.Mapping.AutoExtract && IsFileCompressed(gamePath)))
                         {
-                            ExtractNestedArchives(installDir);
+                            ExtractArchiveWithProgress(gamePath, installDir, progress);
+                            File.Delete(gamePath);
                         }
 
-                        Logger.Debug($"Extraction of {Game.Name} complete.");
+                        progress.CurrentProgressValue = 100;
+                        progress.Text = "Installed";
 
-                        List<string> supportedFileTypes = GetEmulatorSupportedFileTypes(info);
-                        string[] actualRomFiles = GetRomFiles(installDir, supportedFileTypes);
+                        var game = _romM.Playnite.Database.Games[Game.Id];
+                        game.IsInstalled = true;
+                        _romM.Playnite.Database.Games.Update(game);
 
-                        foreach (var romFile in actualRomFiles) {
-                            roms.Add(new GameRom(Game.Name, romFile));
-                        }
-                    } else {
-                        // Add the single ROM file to the list
-                        roms.Add(new GameRom(Game.Name, gamePath));
+                        InvokeOnInstalled(new GameInstalledEventArgs(new GameInstallationData
+                        {
+                            InstallDirectory = installDir,
+                            Roms = new List<GameRom> { new GameRom(Game.Name, gamePath) }
+                        }));
                     }
-
-                    // Update the game's installation status
-                    var game = _romM.Playnite.Database.Games[Game.Id];
-                    game.IsInstalled = true;
-                    _romM.Playnite.Database.Games.Update(game);
-
-                    InvokeOnInstalled(new GameInstalledEventArgs(new GameInstallationData()
+                    catch (OperationCanceledException)
                     {
-                        InstallDirectory = installDir,
-                        Roms = roms,
-                    }));
-                }
-                catch (Exception ex)
-                {
-                    _romM.Playnite.Notifications.Add(Game.GameId, $"Failed to download {Game.Name}.{Environment.NewLine}{Environment.NewLine}{ex}", NotificationType.Error);
-                    Game.IsInstalling = false;
-                    throw;
-                }
-            });
+                        InvokeOnInstallationCancelled(new GameInstallationCancelledEventArgs());
+                    }
+                },
+                new GlobalProgressOptions($"Installing {Game.Name}", true)
+            );
         }
 
         private static string[] GetRomFiles(string installDir, List<string> supportedFileTypes)
@@ -139,34 +138,31 @@ namespace RomM.Games
 
             if (supportedFileTypes == null || supportedFileTypes.Count == 0)
             {
-               return Directory.GetFiles(installDir, "*", SearchOption.AllDirectories)
+                return Directory.GetFiles(installDir, "*", SearchOption.AllDirectories)
                     .Where(file => !file.EndsWith(".m3u", StringComparison.OrdinalIgnoreCase))
                     .ToArray();
             }
-            else
+
+            return supportedFileTypes.SelectMany(fileType =>
             {
-                return supportedFileTypes.SelectMany(fileType =>
+                if (fileType == null || fileType.Contains("../") || fileType.Contains(@"..\"))
                 {
-                    if (fileType == null || fileType.Contains("../") || fileType.Contains(@"..\"))
-                    {
-                        throw new ArgumentException("Invalid file path");
-                    }
-                    return Directory.GetFiles(installDir, "*." + fileType, SearchOption.AllDirectories)
-                        .Where(file => !file.Contains("../") && !file.Contains(@"..\"));
-                }).ToArray();
-            }
+                    throw new ArgumentException("Invalid file path");
+                }
+
+                return Directory.GetFiles(installDir, "*." + fileType, SearchOption.AllDirectories)
+                    .Where(file => !file.Contains("../") && !file.Contains(@"..\"));
+            }).ToArray();
         }
 
         private static List<string> GetEmulatorSupportedFileTypes(RomMGameInfo info)
         {
-            if (info.Mapping.EmulatorProfile is CustomEmulatorProfile)
+            if (info.Mapping.EmulatorProfile is CustomEmulatorProfile customProfile)
             {
-                var customProfile = info.Mapping.EmulatorProfile as CustomEmulatorProfile;
                 return customProfile.ImageExtensions;
             }
-            else if (info.Mapping.EmulatorProfile is BuiltInEmulatorProfile)
+            else if (info.Mapping.EmulatorProfile is BuiltInEmulatorProfile builtInProfile)
             {
-                var builtInProfile = (info.Mapping.EmulatorProfile as BuiltInEmulatorProfile);
                 return API.Instance.Emulation.Emulators
                     .FirstOrDefault(e => e.Id == info.Mapping.Emulator.BuiltInConfigId)?
                     .Profiles
@@ -179,7 +175,6 @@ namespace RomM.Games
 
         private static bool IsFileCompressed(string filePath)
         {
-            // Exclude disk images which aren't handled by sharpcompress
             if (Path.GetExtension(filePath).Equals(".iso", StringComparison.OrdinalIgnoreCase))
             {
                 return false;
@@ -188,35 +183,36 @@ namespace RomM.Games
             return ArchiveFactory.IsArchive(filePath, out var type);
         }
 
-        private void ExtractArchive(string gamePath, string installDir)
+        private void ExtractArchiveWithProgress(
+            string archivePath,
+            string installDir,
+            GlobalProgressActionArgs progress)
         {
-            if (gamePath == null || gamePath.Contains("../") || gamePath.Contains(@"..\"))
+            using (var archive = ArchiveFactory.Open(archivePath))
             {
-                throw new ArgumentException("Invalid game path");
-            }
+                var entries = archive.Entries.Where(e => !e.IsDirectory).ToList();
+                int total = entries.Count;
+                int done = 0;
 
-            if (installDir == null || installDir.Contains("../") || installDir.Contains(@"..\"))
-            {
-                throw new ArgumentException("Invalid install directory path");
-            }
-
-            using (var archive = ArchiveFactory.Open(gamePath))
-            {
-                foreach (var entry in archive.Entries)
+                foreach (var entry in entries)
                 {
-                    if (!entry.IsDirectory)
+                    progress.CancelToken.ThrowIfCancellationRequested();
+
+                    entry.WriteToDirectory(installDir, new ExtractionOptions
                     {
-                        entry.WriteToDirectory(installDir, new ExtractionOptions
-                        {
-                            ExtractFullPath = true,
-                            Overwrite = true
-                        });
-                    }
+                        ExtractFullPath = true,
+                        Overwrite = true
+                    });
+
+                    done++;
+                    double pct = total > 0 ? (double)done / total : 1.0;
+                    progress.CurrentProgressValue = 85 + pct * 15;
+                    progress.Text = $"Extracting {Game.Name}... {pct * 100:0}%";
                 }
             }
         }
 
-        void ExtractNestedArchives(string directoryPath)
+        private void ExtractNestedArchives(string directoryPath, CancellationToken ct, GlobalProgressActionArgs progress)
         {
             if (directoryPath == null || directoryPath.Contains("../") || directoryPath.Contains(@"..\"))
             {
@@ -224,11 +220,14 @@ namespace RomM.Games
             }
 
             foreach (var file in Directory.GetFiles(directoryPath))
-            {   
+            {
+                progress.CancelToken.ThrowIfCancellationRequested();
+
                 if (IsFileCompressed(file))
                 {
-                    ExtractArchive(file, directoryPath);
-                    File.Delete(file);
+                    progress.Text = $"Extracting nested: {Path.GetFileName(file)}";
+                    ExtractArchiveWithProgress(file, directoryPath, progress);
+                    try { File.Delete(file); } catch { }
                 }
             }
         }
